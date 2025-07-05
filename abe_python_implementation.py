@@ -12,13 +12,12 @@ import os
 from openpyxl import load_workbook
 from scipy.special import gammaln  # for log‑factorial constant
 
-# ---------------------------------------------------------------------
 # Helper: enforce uniform decimal display (e.g. 0.63, 2.57, …)
-# ---------------------------------------------------------------------
 def _fmt(df: pd.DataFrame, dec: int) -> pd.DataFrame:
     """Return a copy of *df* with all float cells formatted to *dec* decimals."""
     fmt = f"{{:.{dec}f}}".format
     return df.applymap(lambda v: fmt(v) if isinstance(v, (float, np.floating)) else v)
+
 # Add lifetimes ParetoNBDFitter for MLE baseline
 from lifetimes import ParetoNBDFitter
 
