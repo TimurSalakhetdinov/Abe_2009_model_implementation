@@ -38,7 +38,7 @@ from Models.model_abe_2009_two_param import (
 os.makedirs("Estimation", exist_ok=True)
 excel_path = "Estimation/estimation_summaries.xlsx"
 
-# %% 2. Load dataset and convert to CBS format
+# 2. Load dataset and convert to CBS format
 # ------ 2. Load dataset and convert to CBS format ------
 # We use dataset available in the BTYD package in R
 data_path = os.path.join("Data", "cdnowElog.csv")
@@ -53,7 +53,7 @@ cbs = elog2cbs(cdnowElog, units="W", T_cal="1997-09-30", T_tot="1998-06-30")
 cbs = cbs.rename(columns={"t.x": "t_x", "T.cal": "T_cal", "x.star": "x_star"})
 cbs.head()
 
-# %% 3. Construct Table 1: Descriptive Statistics
+# 3. Construct Table 1: Descriptive Statistics
 # ------ Construct Table 1 from Abe 2009 (Descriptive Statistics) ------
 table1_stats = pd.DataFrame(
     {
@@ -98,7 +98,8 @@ display(table1_stats)
 with pd.ExcelWriter(excel_path, engine="openpyxl", mode="w") as writer:
     table1_stats.to_excel(writer, sheet_name="Table 1")
 
-# %% 4. Estimate Model M1 (no covariates)
+# %% 4. Estimate Models M1 and M2
+# ------ Estimate Models M1 and M2 ------
 # ------ 3. Start with model estimation M1 using no covariates ------
 
 # Estimate Model M1 (no covariates)
@@ -142,7 +143,7 @@ draws_m2 = mcmc_draw_parameters(
     trace=500
 )
 
-# %% 5. Compute metrics and predictions
+# 5. Compute metrics and predictions
 # ------ 5. Computing the metrics for comparison ------
 
 # Function to summarize level 2 draws
@@ -223,20 +224,203 @@ mae_m2 = np.mean(np.abs(cbs["x_star"] - cbs["xstar_m2_pred"]))
 ## The MAE rows are no longer added to the summaries here
 
 # Display both
+
 print("Posterior Summary - Model M1 (no covariates):")
 print(summary_m1)
 
 print("Posterior Summary - Model M2 (with covariates):")
 print(summary_m2)
 
-# %% 6. Construct Table 2: Model Fit Evaluation
+# %% Figures 2–5: Reproduce Abe (2009) plots
+# ------ Build Figures 2–5: Reproduce Abe (2009) plots ------
+# Prepare weekly index and counts
+first_date = cdnowElog["date"].min()
+cdnowElog["week"] = ((cdnowElog["date"] - first_date) // pd.Timedelta("7D")).astype(int) + 1
+max_week = cdnowElog["week"].max()
+
+# Fit classical Pareto/NBD by maximum likelihood
+pnbd_mle = ParetoNBDFitter(penalizer_coef=0.0)
+pnbd_mle.fit(
+    frequency=cbs["x"],
+    recency=cbs["t_x"],
+    T=cbs["T_cal"]
+)
+
+# Expected future repeats for Pareto/NBD (MLE) – 39‑week horizon
+exp_xstar_pnbd = pnbd_mle.conditional_expected_number_of_purchases_up_to_time(
+    t_star,
+    cbs["x"],
+    cbs["t_x"],
+    cbs["T_cal"]
+)
+
+# Figure 2: Weekly cumulative repeat transactions
+cdnowElog_sorted = cdnowElog.sort_values(by=["cust","week"])
+cdnowElog_sorted["txn_order"] = cdnowElog_sorted.groupby("cust").cumcount()
+repeat_txns = cdnowElog_sorted[cdnowElog_sorted["txn_order"] >= 1]
+weekly_actual = (
+    repeat_txns.groupby("week")["cust"].count()
+    .reindex(range(1, max_week+1), fill_value = 0))
+
+# Cumulative actual transactions
+cum_actual = weekly_actual.cumsum()
+
+ # --- Birth‑aligned Pareto/NBD baseline (MLE) -----------------
+# first purchase week for each customer
+birth_week = (
+    cdnowElog.groupby("cust")["week"].min()
+    .reindex(cbs["cust"])
+    .to_numpy()
+)
+
+times = np.arange(1, max_week + 1)
+cum_pnbd_ml = np.zeros_like(times, dtype=float)
+
+for t_idx, t in enumerate(times):
+    # time since first purchase (≥0) for each customer
+    rel_t = np.clip(t - birth_week, 0, None)
+    exp_per_cust = pnbd_mle.expected_number_of_purchases_up_to_time(rel_t)
+    cum_pnbd_ml[t_idx] = exp_per_cust.sum()
+
+# --- Posterior‑predictive HB curve -----------------------------------------
+n_draws = len(xstar_m2_draws)
+inc_hb_weekly = np.zeros_like(times, dtype=float)
+
+for d in range(n_draws):
+    # map flat draw index `d` to (chain, draw) indices
+    draws_per_chain = len(draws_m2["level_1"][0])
+    chain = d // draws_per_chain
+    idx   = d % draws_per_chain
+    lam_d = draws_m2["level_1"][chain][idx, :, 0]
+    mu_d  = draws_m2["level_1"][chain][idx, :, 1]
+    tau_d = draws_m2["level_1"][chain][idx, :, 2]
+
+    rng_d = np.random.default_rng(d)  # reproducible per draw
+    for t_idx, t in enumerate(times):
+        dt = 1.0
+        active = (t > birth_week) & (t <= (birth_week + tau_d))   # after first purchase, before churn
+        inc = rng_d.poisson(lam=lam_d * dt * active)
+        inc_hb_weekly[t_idx] += inc.sum()
+
+# average across draws and take cumulative
+inc_hb_weekly /= n_draws
+cum_hb = np.cumsum(inc_hb_weekly)
+
 # ------------------------------------------------------------------
+# Figure 2 : Weekly cumulative repeat transactions
+# ------------------------------------------------------------------
+plt.figure(figsize=(8, 5))
+plt.plot(times, cum_actual,  '-',           lw=2, color="tab:blue",   label="Actual")
+plt.plot(times, cum_pnbd_ml, '--',          lw=2, color="tab:orange", label="Pareto/NBD (MLE)")
+plt.plot(times, cum_hb,       ':',          lw=2, color="tab:green",  label="HB")
+plt.xlabel("Week")
+plt.ylabel("Cumulative repeat transactions")
+plt.title("Figure 2: Weekly Cumulative Repeat Transactions – CDNOW")
+plt.legend()
+plt.tight_layout()
+plt.savefig(os.path.join("Estimation", "Figure2_weekly_cumulative.png"),
+            dpi=300, bbox_inches="tight")
+plt.show()
+
+# Figure 3: Conditional expectation of future transactions
+# Group by number of calibration transactions (0–7+)
+# Use analytical expectations, with different formulas for Pareto/NBD (M1) and HB (M2)
+
+# Expected future repeats for Figure 3:
+all_draws_m1 = np.concatenate(draws_m1["level_1"], axis=0)
+all_draws_m2 = np.concatenate(draws_m2["level_1"], axis=0)
+
+mean_lambda_m1_cust = all_draws_m1[:, :, 0].mean(axis=0)
+mean_mu_m1_cust     = all_draws_m1[:, :, 1].mean(axis=0)
+mean_z_m1_cust      = all_draws_m1[:, :, 3].mean(axis=0)
+
+mean_lambda_m2_cust = all_draws_m2[:, :, 0].mean(axis=0)
+mean_mu_m2_cust     = all_draws_m2[:, :, 1].mean(axis=0)
+mean_z_m2_cust      = all_draws_m2[:, :, 3].mean(axis=0)
+
+#
+# Classical Pareto/NBD (MLE) expected future repeats for the next 39 weeks
+exp_xstar_m1 = pnbd_mle.conditional_expected_number_of_purchases_up_to_time(
+    t_star,
+    cbs["x"],
+    cbs["t_x"],
+    cbs["T_cal"]
+)
+
+# HB expectation (Model M2) – include posterior P(alive)
+exp_xstar_m2 = mean_z_m2_cust * (mean_lambda_m2_cust / mean_mu_m2_cust) * (1 - np.exp(-mean_mu_m2_cust * t_star))
+
+df = pd.DataFrame({
+    "x":      cbs["x"],
+    "actual": cbs["x_star"],
+    "pnbd":   exp_xstar_m1,   # Pareto/NBD expectation (no P(alive))
+    "hb":     exp_xstar_m2    # HB expectation (with P(alive))
+})
+groups = []
+for k in range(7):
+    grp = df[df["x"]==k]
+    groups.append((str(k), grp["actual"].mean(), grp["pnbd"].mean(), grp["hb"].mean()))
+grp7 = df[df["x"]>=7]
+groups.append(("7+", grp7["actual"].mean(), grp7["pnbd"].mean(), grp7["hb"].mean()))
+cond_df = pd.DataFrame(groups, columns=["x","Actual","Pareto/NBD","HB"]).set_index("x")
+
+plt.figure(figsize=(8,5))
+plt.plot(cond_df.index, cond_df["Actual"], '-', color='tab:blue', linewidth=2, label="Actual")
+plt.plot(cond_df.index, cond_df["Pareto/NBD"], marker='*', linestyle='--', color='tab:orange', linewidth=2, label="Pareto/NBD")
+plt.plot(cond_df.index, cond_df["HB"], marker='x', linestyle=':', color='tab:green', linewidth=2, label="HB")
+plt.xlabel("Number of transactions in weeks 1–39")
+plt.ylabel("Average transactions in weeks 40–78")
+plt.title("Figure 3: Conditional Expectation of Future Transactions for CDNOW Data")
+plt.legend()
+plt.savefig(os.path.join("Estimation","Figure3_conditional_expectation.png"), dpi=300, bbox_inches='tight')
+plt.show()
+
+# Figure 4: Scatter plot of posterior means of λ and μ  (HB‑M1, paper style)
+mean_lambda_m1 = post_mean_lambdas(draws_m1)
+mean_mu_m1     = post_mean_mus(draws_m1)
+
+plt.figure(figsize=(6, 6))
+plt.scatter(mean_lambda_m1, mean_mu_m1, s=8, alpha=0.25, color="tab:blue")
+plt.xlim(0, 4)
+plt.ylim(0, 0.14)
+plt.xlabel(r"$\lambda$")
+plt.ylabel(r"$\mu$")
+plt.title("Figure 4: Scatter Plot of Posterior Means of λ and μ for CDNOW Data")
+plt.savefig(os.path.join("Estimation", "Figure4_scatter_lambda_mu.png"),
+            dpi=300, bbox_inches="tight")
+plt.show()
+
+# Figure 5: Histogram of correlation between log(λ) and log(μ)
+
+# Flatten level‑2 draws across chains
+level2_all = np.vstack(draws_m2["level_2"])   # shape (total_draws, n_params)
+
+# Column order in draws: [..., var_log_lambda, var_log_mu, cov_log_lambda_mu]
+var_l = level2_all[:, -3]   # sigma^2_lambda
+cov   = level2_all[:, -2]   # cov_log_lambda_mu
+var_m = level2_all[:, -1]   # sigma^2_mu
+
+# Keep draws with strictly positive variances
+mask = (var_l > 0) & (var_m > 0)
+corr_draws = cov[mask] / np.sqrt(var_l[mask] * var_m[mask])
+
+plt.figure(figsize=(8, 4))
+plt.hist(corr_draws, bins=30, edgecolor="k")
+plt.xlim(-0.3, 0.4)
+plt.xlabel("Correlation")
+plt.ylabel("Frequency")
+plt.title("Figure 5: Distribution of Correlation Between log(λ) and log(μ) for CDNOW Data")
+plt.savefig(os.path.join("Estimation", "Figure5_corr_histogram.png"),
+            dpi=300, bbox_inches="tight")
+plt.show()
+
+# %% 6. Construct Table 2: Model-Fit Metrics
 # Table 2 – Model‑fit metrics
 # ------------------------------------------------------------------
 # --- individual‑level correlation & MSE ---------------------------
 # Validation period (x_star)
-corr_val_pnbd = np.corrcoef(cbs["x_star"], exp_xstar_m1)[0, 1]
-mse_val_pnbd  = np.mean((cbs["x_star"] - exp_xstar_m1) ** 2)
+corr_val_pnbd = np.corrcoef(cbs["x_star"], exp_xstar_pnbd)[0, 1]
+mse_val_pnbd  = np.mean((cbs["x_star"] - exp_xstar_pnbd) ** 2)
 
 corr_val_m1 = np.corrcoef(cbs["x_star"], cbs["xstar_m1_pred"])[0, 1]
 mse_val_m1  = np.mean((cbs["x_star"] - cbs["xstar_m1_pred"]) ** 2)
@@ -257,7 +441,7 @@ mse_calib_m1  = np.mean((cbs["x"] - calib_pred_m1) ** 2)
 corr_calib_m2 = np.corrcoef(cbs["x"], calib_pred_m2)[0, 1]
 mse_calib_m2  = np.mean((cbs["x"] - calib_pred_m2) ** 2)
 
- # Abe (2009): both windows are 39 weeks long – weeks 1‑39 vs. 40‑78
+# Abe (2009): both windows are 39 weeks long – weeks 1‑39 vs. 40‑78
 weeks_cal_mask = (times >= 1)  & (times <= 39)
 weeks_val_mask = (times >= 40) & (times <= 78)
 
@@ -274,6 +458,52 @@ def mape_aggregate(actual, pred):
     abs_error = np.abs(cum_p - cum_a)
     return abs_error.mean() / cum_a[-1] * 100
 
+ # ------------------------------------------------------------------
+# Build HB weekly increment curve (Model M2) 
+# ------------------------------------------------------------------
+if "inc_hb_weekly_m2" not in globals():
+    n_draws_m2 = len(xstar_m2_draws)
+    inc_hb_weekly_m2 = np.zeros_like(times, dtype=float)
+
+    for d in range(n_draws_m2):
+        draws_per_chain = len(draws_m2["level_1"][0])
+        chain = d // draws_per_chain
+        idx   = d % draws_per_chain
+        lam_d = draws_m2["level_1"][chain][idx, :, 0]
+        mu_d  = draws_m2["level_1"][chain][idx, :, 1]
+        tau_d = draws_m2["level_1"][chain][idx, :, 2]
+
+        rng_d = np.random.default_rng(d)
+        for t_idx, t in enumerate(times):
+            active = (t > birth_week) & (t <= (birth_week + tau_d))
+            inc = rng_d.poisson(lam=lam_d * active)
+            inc_hb_weekly_m2[t_idx] += inc.sum()
+
+    inc_hb_weekly_m2 /= n_draws_m2     # finished M2 curve
+
+# ------------------------------------------------------------------
+# Build HB weekly increment curve (Model M1) 
+# ------------------------------------------------------------------
+if "inc_hb_weekly_m1" not in globals():
+    n_draws_m1 = len(xstar_m1_draws)
+    inc_hb_weekly_m1 = np.zeros_like(times, dtype=float)
+
+    for d in range(n_draws_m1):
+        draws_per_chain = len(draws_m1["level_1"][0])
+        chain = d // draws_per_chain
+        idx   = d % draws_per_chain
+        lam_d = draws_m1["level_1"][chain][idx, :, 0]
+        mu_d  = draws_m1["level_1"][chain][idx, :, 1]
+        tau_d = draws_m1["level_1"][chain][idx, :, 2]
+
+        rng_d = np.random.default_rng(d + 123)   # offset seed so M1 vs M2 differ
+        for t_idx, t in enumerate(times):
+            active = (t > birth_week) & (t <= (birth_week + tau_d))
+            inc = rng_d.poisson(lam=lam_d * active)
+            inc_hb_weekly_m1[t_idx] += inc.sum()
+
+    inc_hb_weekly_m1 /= n_draws_m1     # finished M1 curve
+
 # Weekly PNB (MLE) increments
 inc_pnbd_weekly = np.empty_like(times, dtype=float)
 inc_pnbd_weekly[0] = cum_pnbd_ml[0]
@@ -284,14 +514,14 @@ mapecum_val_pnbd = mape_aggregate(actual_weekly[weeks_val_mask], inc_pnbd_weekly
 mapecum_cal_pnbd = mape_aggregate(actual_weekly[weeks_cal_mask], inc_pnbd_weekly[weeks_cal_mask])
 mapecum_pool_pnbd = mape_aggregate(actual_weekly, inc_pnbd_weekly)
 
-mapecum_val_m1 = mape_aggregate(actual_weekly[weeks_val_mask], inc_hb_weekly[weeks_val_mask])
-mapecum_cal_m1 = mape_aggregate(actual_weekly[weeks_cal_mask], inc_hb_weekly[weeks_cal_mask])
-mapecum_pool_m1 = mape_aggregate(actual_weekly, inc_hb_weekly)
+mapecum_val_m1 = mape_aggregate(actual_weekly[weeks_val_mask], inc_hb_weekly_m1[weeks_val_mask])
+mapecum_cal_m1 = mape_aggregate(actual_weekly[weeks_cal_mask], inc_hb_weekly_m1[weeks_cal_mask])
+mapecum_pool_m1 = mape_aggregate(actual_weekly, inc_hb_weekly_m1)
 
-# HB M2 uses same weekly draw series
-mapecum_val_m2 = mapecum_val_m1
-mapecum_cal_m2 = mapecum_cal_m1
-mapecum_pool_m2 = mapecum_pool_m1
+# HB M2 — separate weekly draw series
+mapecum_val_m2 = mape_aggregate(actual_weekly[weeks_val_mask], inc_hb_weekly_m2[weeks_val_mask])
+mapecum_cal_m2 = mape_aggregate(actual_weekly[weeks_cal_mask], inc_hb_weekly_m2[weeks_cal_mask])
+mapecum_pool_m2 = mape_aggregate(actual_weekly, inc_hb_weekly_m2)
 
 # --- assemble DataFrame ------------------------------------------
 table2 = pd.DataFrame({
@@ -532,175 +762,6 @@ with pd.ExcelWriter(excel_path, engine="openpyxl", mode="a", if_sheet_exists="re
     table4.to_excel(writer, sheet_name="Table 4")
 
 
-# %% Figures 2–5: Reproduce Abe (2009) plots
-# Prepare weekly index and counts
-first_date = cdnowElog["date"].min()
-cdnowElog["week"] = ((cdnowElog["date"] - first_date) // pd.Timedelta("7D")).astype(int) + 1
-max_week = cdnowElog["week"].max()
-
-# Fit classical Pareto/NBD by maximum likelihood
-pnbd_mle = ParetoNBDFitter(penalizer_coef=0.0)
-pnbd_mle.fit(
-    frequency=cbs["x"],
-    recency=cbs["t_x"],
-    T=cbs["T_cal"]
-)
-
-# Figure 2: Weekly cumulative repeat transactions
-cdnowElog_sorted = cdnowElog.sort_values(by=["cust","week"])
-cdnowElog_sorted["txn_order"] = cdnowElog_sorted.groupby("cust").cumcount()
-repeat_txns = cdnowElog_sorted[cdnowElog_sorted["txn_order"] >= 1]
-weekly_actual = (
-    repeat_txns.groupby("week")["cust"].count()
-    .reindex(range(1, max_week+1), fill_value = 0))
-
-# Cumulative actual transactions
-cum_actual = weekly_actual.cumsum()
-
- # --- Birth‑aligned Pareto/NBD baseline (MLE) -----------------
-# first purchase week for each customer
-birth_week = (
-    cdnowElog.groupby("cust")["week"].min()
-    .reindex(cbs["cust"])
-    .to_numpy()
-)
-
-times = np.arange(1, max_week + 1)
-cum_pnbd_ml = np.zeros_like(times, dtype=float)
-
-for t_idx, t in enumerate(times):
-    # time since first purchase (≥0) for each customer
-    rel_t = np.clip(t - birth_week, 0, None)
-    exp_per_cust = pnbd_mle.expected_number_of_purchases_up_to_time(rel_t)
-    cum_pnbd_ml[t_idx] = exp_per_cust.sum()
-
-# --- Posterior‑predictive HB curve -----------------------------------------
-n_draws = len(xstar_m2_draws)
-inc_hb_weekly = np.zeros_like(times, dtype=float)
-
-for d in range(n_draws):
-    # map flat draw index `d` to (chain, draw) indices
-    draws_per_chain = len(draws_m2["level_1"][0])
-    chain = d // draws_per_chain
-    idx   = d % draws_per_chain
-    lam_d = draws_m2["level_1"][chain][idx, :, 0]
-    mu_d  = draws_m2["level_1"][chain][idx, :, 1]
-    tau_d = draws_m2["level_1"][chain][idx, :, 2]
-
-    rng_d = np.random.default_rng(d)  # reproducible per draw
-    for t_idx, t in enumerate(times):
-        dt = 1.0
-        active = (t > birth_week) & (t <= (birth_week + tau_d))   # after first purchase, before churn
-        inc = rng_d.poisson(lam=lam_d * dt * active)
-        inc_hb_weekly[t_idx] += inc.sum()
-
-# average across draws and take cumulative
-inc_hb_weekly /= n_draws
-cum_hb = np.cumsum(inc_hb_weekly)
-
-plt.figure(figsize=(8,5))
-plt.plot(times, cum_actual, '-', color='tab:blue', linewidth=2, label="Actual")
-plt.plot(times, cum_pnbd_ml, '--', color='tab:orange', linewidth=2, label="Pareto/NBD (MLE)")
-plt.plot(times, cum_hb, ':', color='tab:green', linewidth=2, label="HB")
-plt.axvline(x=int(t_star), color='k', linestyle='--')
-plt.xlabel("Week")
-plt.ylabel("Cumulative repeat transactions")
-plt.title("Figure 2: Weekly Time-Series Tracking for CDNOW Data")
-plt.legend()
-plt.savefig(os.path.join("Estimation","Figure2_weekly_tracking.png"), dpi=300, bbox_inches='tight')
-plt.show()
-
-# Figure 3: Conditional expectation of future transactions
-# Group by number of calibration transactions (0–7+)
-# Use analytical expectations, with different formulas for Pareto/NBD (M1) and HB (M2)
-
-# Expected future repeats for Figure 3:
-all_draws_m1 = np.concatenate(draws_m1["level_1"], axis=0)
-all_draws_m2 = np.concatenate(draws_m2["level_1"], axis=0)
-
-mean_lambda_m1_cust = all_draws_m1[:, :, 0].mean(axis=0)
-mean_mu_m1_cust     = all_draws_m1[:, :, 1].mean(axis=0)
-mean_z_m1_cust      = all_draws_m1[:, :, 3].mean(axis=0)
-
-mean_lambda_m2_cust = all_draws_m2[:, :, 0].mean(axis=0)
-mean_mu_m2_cust     = all_draws_m2[:, :, 1].mean(axis=0)
-mean_z_m2_cust      = all_draws_m2[:, :, 3].mean(axis=0)
-
-#
-# Classical Pareto/NBD (MLE) expected future repeats for the next 39 weeks
-exp_xstar_m1 = pnbd_mle.conditional_expected_number_of_purchases_up_to_time(
-    t_star,
-    cbs["x"],
-    cbs["t_x"],
-    cbs["T_cal"]
-)
-
-# HB expectation (Model M2) – include posterior P(alive)
-exp_xstar_m2 = mean_z_m2_cust * (mean_lambda_m2_cust / mean_mu_m2_cust) * (1 - np.exp(-mean_mu_m2_cust * t_star))
-
-df = pd.DataFrame({
-    "x":      cbs["x"],
-    "actual": cbs["x_star"],
-    "pnbd":   exp_xstar_m1,   # Pareto/NBD expectation (no P(alive))
-    "hb":     exp_xstar_m2    # HB expectation (with P(alive))
-})
-groups = []
-for k in range(7):
-    grp = df[df["x"]==k]
-    groups.append((str(k), grp["actual"].mean(), grp["pnbd"].mean(), grp["hb"].mean()))
-grp7 = df[df["x"]>=7]
-groups.append(("7+", grp7["actual"].mean(), grp7["pnbd"].mean(), grp7["hb"].mean()))
-cond_df = pd.DataFrame(groups, columns=["x","Actual","Pareto/NBD","HB"]).set_index("x")
-
-plt.figure(figsize=(8,5))
-plt.plot(cond_df.index, cond_df["Actual"], '-', color='tab:blue', linewidth=2, label="Actual")
-plt.plot(cond_df.index, cond_df["Pareto/NBD"], marker='*', linestyle='--', color='tab:orange', linewidth=2, label="Pareto/NBD")
-plt.plot(cond_df.index, cond_df["HB"], marker='x', linestyle=':', color='tab:green', linewidth=2, label="HB")
-plt.xlabel("Number of transactions in weeks 1–39")
-plt.ylabel("Average transactions in weeks 40–78")
-plt.title("Figure 3: Conditional Expectation of Future Transactions for CDNOW Data")
-plt.legend()
-plt.savefig(os.path.join("Estimation","Figure3_conditional_expectation.png"), dpi=300, bbox_inches='tight')
-plt.show()
-
-# Figure 4: Scatter plot of posterior means of λ and μ  (HB‑M1, paper style)
-mean_lambda_m1 = post_mean_lambdas(draws_m1)
-mean_mu_m1     = post_mean_mus(draws_m1)
-
-plt.figure(figsize=(6, 6))
-plt.scatter(mean_lambda_m1, mean_mu_m1, s=8, alpha=0.25, color="tab:blue")
-plt.xlim(0, 4)
-plt.ylim(0, 0.14)
-plt.xlabel(r"$\lambda$")
-plt.ylabel(r"$\mu$")
-plt.title("Figure 4: Scatter Plot of Posterior Means of λ and μ for CDNOW Data")
-plt.savefig(os.path.join("Estimation", "Figure4_scatter_lambda_mu.png"),
-            dpi=300, bbox_inches="tight")
-plt.show()
-
-# Figure 5: Histogram of correlation between log(λ) and log(μ)
-
-# Flatten level‑2 draws across chains
-level2_all = np.vstack(draws_m2["level_2"])   # shape (total_draws, n_params)
-
-# Column order in draws: [..., var_log_lambda, var_log_mu, cov_log_lambda_mu]
-var_l = level2_all[:, -3]   # sigma^2_lambda
-cov   = level2_all[:, -2]   # cov_log_lambda_mu
-var_m = level2_all[:, -1]   # sigma^2_mu
-
-# Keep draws with strictly positive variances
-mask = (var_l > 0) & (var_m > 0)
-corr_draws = cov[mask] / np.sqrt(var_l[mask] * var_m[mask])
-
-plt.figure(figsize=(8, 4))
-plt.hist(corr_draws, bins=30, edgecolor="k")
-plt.xlim(-0.3, 0.4)
-plt.xlabel("Correlation")
-plt.ylabel("Frequency")
-plt.title("Figure 5: Distribution of Correlation Between log(λ) and log(μ) for CDNOW Data")
-plt.savefig(os.path.join("Estimation", "Figure5_corr_histogram.png"),
-            dpi=300, bbox_inches="tight")
-plt.show()
 
 
 
@@ -878,4 +939,3 @@ fig = az.plot_posterior(
 plt.suptitle("Posterior Distributions - M2", fontsize=16, y=1.02)
 plt.subplots_adjust(hspace=0.5)
 plt.show()
-# %%
