@@ -1,5 +1,5 @@
 # %% 1. Import necessary libraries
-# ------ 1. Import necessary libraries ------
+# ------ 1. Import necessary libraries and load data ------
 # ---------------------------------------------------------------------
 # Helper: enforce uniform decimal display (e.g. 0.63, 2.57, …)
 # ---------------------------------------------------------------------
@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import arviz as az
 import os
+import pickle
 from openpyxl import load_workbook
 from scipy.special import gammaln  # for log‑factorial constant
 
@@ -34,9 +35,11 @@ from Models.model_abe_2009_two_param import (
     draw_future_transactions
 )
 
-# Ensure Estimation directory exists
 os.makedirs("Estimation", exist_ok=True)
+os.makedirs("Pickles", exist_ok=True)
 excel_path = "Estimation/estimation_summaries.xlsx"
+m1_pickle_path = os.path.join("Pickles", "draws_m1.pkl")
+m2_pickle_path = os.path.join("Pickles", "draws_m2.pkl")
 
 # 2. Load dataset and convert to CBS format
 # ------ 2. Load dataset and convert to CBS format ------
@@ -102,17 +105,27 @@ with pd.ExcelWriter(excel_path, engine="openpyxl", mode="w") as writer:
 # ------ Estimate Models M1 and M2 ------
 # ------ 3. Start with model estimation M1 using no covariates ------
 
-# Estimate Model M1 (no covariates)
-draws_m1 = mcmc_draw_parameters(
-    cal_cbs=cbs,
-    covariates=[],
-    mcmc=4000,
-    burnin=10000,
-    thin=50,
-    chains=2,
-    seed=42,
-    trace=1000
-)
+# ---------------------------------------------------------------
+# Estimate or load Model M1 (no covariates)
+# ---------------------------------------------------------------
+if os.path.exists(m1_pickle_path):
+    with open(m1_pickle_path, "rb") as f:
+        draws_m1 = pickle.load(f)
+    print("Loaded M1 draws from pickle.")
+else:
+    draws_m1 = mcmc_draw_parameters(
+        cal_cbs=cbs,
+        covariates=[],
+        mcmc=4000,
+        burnin=10000,
+        thin=50,
+        chains=2,
+        seed=42,
+        trace=1000
+    )
+    with open(m1_pickle_path, "wb") as f:
+        pickle.dump(draws_m1, f)
+    print("Saved M1 draws to pickle.")
 
 # ------ 4. Estimate Model M2 (with covariates) ------
 
@@ -131,17 +144,27 @@ mean_val = cbs["first_sales"].mean()
 std_val = cbs["first_sales"].std()
 cbs["first_sales_scaled"] = (cbs["first_sales"] - mean_val) / std_val
 
-# Estimate Model M2 (with first_sales)
-draws_m2 = mcmc_draw_parameters(
-    cal_cbs=cbs,
-    covariates=["first_sales_scaled"],
-    mcmc=4000,
-    burnin=10000,
-    thin=50,
-    chains=2,
-    seed=42,
-    trace=500
-)
+# ---------------------------------------------------------------
+# Estimate or load Model M2 (with first_sales)
+# ---------------------------------------------------------------
+if os.path.exists(m2_pickle_path):
+    with open(m2_pickle_path, "rb") as f:
+        draws_m2 = pickle.load(f)
+    print("Loaded M2 draws from pickle.")
+else:
+    draws_m2 = mcmc_draw_parameters(
+        cal_cbs=cbs,
+        covariates=["first_sales_scaled"],
+        mcmc=4000,
+        burnin=10000,
+        thin=50,
+        chains=2,
+        seed=42,
+        trace=500
+    )
+    with open(m2_pickle_path, "wb") as f:
+        pickle.dump(draws_m2, f)
+    print("Saved M2 draws to pickle.")
 
 # 5. Compute metrics and predictions
 # ------ 5. Computing the metrics for comparison ------
@@ -282,6 +305,13 @@ for t_idx, t in enumerate(times):
     exp_per_cust = pnbd_mle.expected_number_of_purchases_up_to_time(rel_t)
     cum_pnbd_ml[t_idx] = exp_per_cust.sum()
 
+n_draws = None
+# ------------------------------------------------------------------
+# Generate posterior‑predictive draws for validation window if needed
+# ------------------------------------------------------------------
+if "xstar_m2_draws" not in globals():
+    xstar_m1_draws = draw_future_transactions(cbs, draws_m1, T_star=t_star, seed=42)
+    xstar_m2_draws = draw_future_transactions(cbs, draws_m2, T_star=t_star, seed=42)
 # --- Posterior‑predictive HB curve -----------------------------------------
 n_draws = len(xstar_m2_draws)
 inc_hb_weekly = np.zeros_like(times, dtype=float)
@@ -338,7 +368,6 @@ mean_lambda_m2_cust = all_draws_m2[:, :, 0].mean(axis=0)
 mean_mu_m2_cust     = all_draws_m2[:, :, 1].mean(axis=0)
 mean_z_m2_cust      = all_draws_m2[:, :, 3].mean(axis=0)
 
-#
 # Classical Pareto/NBD (MLE) expected future repeats for the next 39 weeks
 exp_xstar_m1 = pnbd_mle.conditional_expected_number_of_purchases_up_to_time(
     t_star,
@@ -458,29 +487,6 @@ def mape_aggregate(actual, pred):
     abs_error = np.abs(cum_p - cum_a)
     return abs_error.mean() / cum_a[-1] * 100
 
- # ------------------------------------------------------------------
-# Build HB weekly increment curve (Model M2) 
-# ------------------------------------------------------------------
-if "inc_hb_weekly_m2" not in globals():
-    n_draws_m2 = len(xstar_m2_draws)
-    inc_hb_weekly_m2 = np.zeros_like(times, dtype=float)
-
-    for d in range(n_draws_m2):
-        draws_per_chain = len(draws_m2["level_1"][0])
-        chain = d // draws_per_chain
-        idx   = d % draws_per_chain
-        lam_d = draws_m2["level_1"][chain][idx, :, 0]
-        mu_d  = draws_m2["level_1"][chain][idx, :, 1]
-        tau_d = draws_m2["level_1"][chain][idx, :, 2]
-
-        rng_d = np.random.default_rng(d)
-        for t_idx, t in enumerate(times):
-            active = (t > birth_week) & (t <= (birth_week + tau_d))
-            inc = rng_d.poisson(lam=lam_d * active)
-            inc_hb_weekly_m2[t_idx] += inc.sum()
-
-    inc_hb_weekly_m2 /= n_draws_m2     # finished M2 curve
-
 # ------------------------------------------------------------------
 # Build HB weekly increment curve (Model M1) 
 # ------------------------------------------------------------------
@@ -503,6 +509,29 @@ if "inc_hb_weekly_m1" not in globals():
             inc_hb_weekly_m1[t_idx] += inc.sum()
 
     inc_hb_weekly_m1 /= n_draws_m1     # finished M1 curve
+
+# ------------------------------------------------------------------
+# Build HB weekly increment curve (Model M2) 
+# ------------------------------------------------------------------
+if "inc_hb_weekly_m2" not in globals():
+    n_draws_m2 = len(xstar_m2_draws)
+    inc_hb_weekly_m2 = np.zeros_like(times, dtype=float)
+
+    for d in range(n_draws_m2):
+        draws_per_chain = len(draws_m2["level_1"][0])
+        chain = d // draws_per_chain
+        idx   = d % draws_per_chain
+        lam_d = draws_m2["level_1"][chain][idx, :, 0]
+        mu_d  = draws_m2["level_1"][chain][idx, :, 1]
+        tau_d = draws_m2["level_1"][chain][idx, :, 2]
+
+        rng_d = np.random.default_rng(d)
+        for t_idx, t in enumerate(times):
+            active = (t > birth_week) & (t <= (birth_week + tau_d))
+            inc = rng_d.poisson(lam=lam_d * active)
+            inc_hb_weekly_m2[t_idx] += inc.sum()
+
+    inc_hb_weekly_m2 /= n_draws_m2     # finished M2 curve
 
 # Weekly PNB (MLE) increments
 inc_pnbd_weekly = np.empty_like(times, dtype=float)
