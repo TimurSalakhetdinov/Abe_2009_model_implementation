@@ -166,93 +166,6 @@ else:
         pickle.dump(draws_m2, f)
     print("Saved M2 draws to pickle.")
 
-# 5. Compute metrics and predictions
-# ------ 5. Computing the metrics for comparison ------
-
-# Function to summarize level 2 draws
-def summarize_level2(draws_level2: np.ndarray, param_names: list[str], decimals: int = 2) -> pd.DataFrame:
-    quantiles = np.percentile(draws_level2, [2.5, 50, 97.5], axis=0)
-    summary = pd.DataFrame(quantiles.T, columns=["2.5%", "50%", "97.5%"], index=param_names)
-    return summary.round(decimals)
-
-# Parameter names for Model 1 (M1): no covariates
-param_names_m1 = [
-    "log_lambda (intercept)",
-    "log_mu (intercept)",
-    "var_log_lambda",
-    "var_log_mu",
-    "cov_log_lambda_mu"
-]
-
-# Parameter names for Model 2 (M2): with covariate "first.sales"
-param_names_m2 = [
-    "log_lambda (intercept)",
-    "log_lambda (first.sales)",
-    "log_mu (intercept)",
-    "log_mu (first.sales)",
-    "var_log_lambda",
-    "var_log_mu",
-    "cov_log_lambda_mu"
-]
-
-# Compute summaries
-summary_m1 = summarize_level2(draws_m1["level_2"][0], param_names=param_names_m1)
-summary_m2 = summarize_level2(draws_m2["level_2"][0], param_names=param_names_m2)
-
-# Drop "MAE" row if present
-summary_m1 = summary_m1.drop(index="MAE", errors="ignore")
-summary_m2 = summary_m2.drop(index="MAE", errors="ignore")
-
-# Rename indices to match Table 3 from the paper
-summary_m1.index = [
-    "Purchase rate log(λ) - Intercept",
-    "Dropout rate log(μ) - Intercept",
-    "sigma^2_λ = var[log λ]",
-    "sigma^2_μ = var[log μ]",
-    "sigma_λ_μ = cov[log λ, log μ]"
-]
-summary_m2.index = [
-    "Purchase rate log(λ) - Intercept",
-    "Purchase rate log(λ) - Initial amount ($ 10^-3)",
-    "Dropout rate log(μ) - Intercept",
-    "Dropout rate log(μ) - Initial amount ($ 10^-3)",
-    "sigma^2_λ = var[log λ]",
-    "sigma^2_μ = var[log μ]",
-    "sigma_λ_μ = cov[log λ, log μ]"
-]
-
-# Compute posterior means of λ and μ
-def post_mean_lambdas(draws):
-    all_draws = np.concatenate(draws["level_1"], axis=0)
-    return all_draws[:, :, 0].mean(axis=0)
-
-def post_mean_mus(draws):
-    all_draws = np.concatenate(draws["level_1"], axis=0)
-    return all_draws[:, :, 1].mean(axis=0)
-
-# Closed-form expected x_star for validation
-t_star = 39.0
-mean_lambda_m1 = post_mean_lambdas(draws_m1)
-mean_mu_m1     = post_mean_mus(draws_m1)
-mean_lambda_m2 = post_mean_lambdas(draws_m2)
-mean_mu_m2     = post_mean_mus(draws_m2)
-
-cbs["xstar_m1_pred"] = (mean_lambda_m1/mean_mu_m1) * (1 - np.exp(-mean_mu_m1 * t_star))
-cbs["xstar_m2_pred"] = (mean_lambda_m2/mean_mu_m2) * (1 - np.exp(-mean_mu_m2 * t_star))
-
-# Compare MAE
-mae_m1 = np.mean(np.abs(cbs["x_star"] - cbs["xstar_m1_pred"]))
-mae_m2 = np.mean(np.abs(cbs["x_star"] - cbs["xstar_m2_pred"]))
-
-## The MAE rows are no longer added to the summaries here
-
-# Display both
-
-print("Posterior Summary - Model M1 (no covariates):")
-print(summary_m1)
-
-print("Posterior Summary - Model M2 (with covariates):")
-print(summary_m2)
 
 # %% Figures 2–5: Reproduce Abe (2009) plots
 # ------ Build Figures 2–5: Reproduce Abe (2009) plots ------
@@ -263,11 +176,15 @@ max_week = cdnowElog["week"].max()
 
 # Fit classical Pareto/NBD by maximum likelihood
 pnbd_mle = ParetoNBDFitter(penalizer_coef=0.0)
+# Fit classical Pareto/NBD by maximum likelihood
 pnbd_mle.fit(
     frequency=cbs["x"],
     recency=cbs["t_x"],
     T=cbs["T_cal"]
 )
+
+# Horizon for validation / prediction windows (weeks)
+t_star = 39.0
 
 # Expected future repeats for Pareto/NBD (MLE) – 39‑week horizon
 exp_xstar_pnbd = pnbd_mle.conditional_expected_number_of_purchases_up_to_time(
@@ -404,6 +321,20 @@ plt.legend()
 plt.savefig(os.path.join("Estimation","Figure3_conditional_expectation.png"), dpi=300, bbox_inches='tight')
 plt.show()
 
+#
+# ------------------------------------------------------------------
+# Helper: posterior mean λ and μ per customer (needed for Fig 4 & Table 2)
+# ------------------------------------------------------------------
+if "post_mean_lambdas" not in globals():
+    def post_mean_lambdas(draws):
+        all_draws = np.concatenate(draws["level_1"], axis=0)
+        return all_draws[:, :, 0].mean(axis=0)
+
+if "post_mean_mus" not in globals():
+    def post_mean_mus(draws):
+        all_draws = np.concatenate(draws["level_1"], axis=0)
+        return all_draws[:, :, 1].mean(axis=0)
+
 # Figure 4: Scatter plot of posterior means of λ and μ  (HB‑M1, paper style)
 mean_lambda_m1 = post_mean_lambdas(draws_m1)
 mean_mu_m1     = post_mean_mus(draws_m1)
@@ -443,7 +374,27 @@ plt.savefig(os.path.join("Estimation", "Figure5_corr_histogram.png"),
             dpi=300, bbox_inches="tight")
 plt.show()
 
-# %% 6. Construct Table 2: Model-Fit Metrics
+# %% Tables 2–4: Reproduce Abe (2009) tables
+# ------ Tables 2–4: Reproduce Abe (2009) tables ------
+# ------------------------------------------------------------------
+# 6. Construct Table 2: Model-Fit Metrics
+# -- helpers moved from old section ---------------------------------
+def post_mean_lambdas(draws):
+    all_draws = np.concatenate(draws["level_1"], axis=0)
+    return all_draws[:, :, 0].mean(axis=0)
+
+def post_mean_mus(draws):
+    all_draws = np.concatenate(draws["level_1"], axis=0)
+    return all_draws[:, :, 1].mean(axis=0)
+
+t_star = 39.0
+mean_lambda_m1 = post_mean_lambdas(draws_m1)
+mean_mu_m1     = post_mean_mus(draws_m1)
+mean_lambda_m2 = post_mean_lambdas(draws_m2)
+mean_mu_m2     = post_mean_mus(draws_m2)
+
+cbs["xstar_m1_pred"] = (mean_lambda_m1 / mean_mu_m1) * (1 - np.exp(-mean_mu_m1 * t_star))
+cbs["xstar_m2_pred"] = (mean_lambda_m2 / mean_mu_m2) * (1 - np.exp(-mean_mu_m2 * t_star))
 # Table 2 – Model‑fit metrics
 # ------------------------------------------------------------------
 # --- individual‑level correlation & MSE ---------------------------
@@ -591,7 +542,41 @@ display(table2_disp)
 with pd.ExcelWriter(excel_path, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
     table2_formatted.to_excel(writer, sheet_name="Table 2", index=False, float_format="%.2f")
 
-# %% 7. Construct Table 3: Estimation Results
+# 7. Construct Table 3: Estimation Results
+# -- summarise level‑2 draws (moved here) ---------------------------
+def summarize_level2(draws_level2: np.ndarray, param_names: list[str], decimals: int = 2) -> pd.DataFrame:
+    qs = np.percentile(draws_level2, [2.5, 50, 97.5], axis=0)
+    return pd.DataFrame(qs.T, columns=["2.5%", "50%", "97.5%"], index=param_names).round(decimals)
+
+param_names_m1 = [
+    "log_lambda (intercept)", "log_mu (intercept)",
+    "var_log_lambda", "var_log_mu", "cov_log_lambda_mu"
+]
+param_names_m2 = [
+    "log_lambda (intercept)", "log_lambda (first.sales)",
+    "log_mu (intercept)", "log_mu (first.sales)",
+    "var_log_lambda", "var_log_mu", "cov_log_lambda_mu"
+]
+
+summary_m1 = summarize_level2(draws_m1["level_2"][0], param_names_m1)
+summary_m2 = summarize_level2(draws_m2["level_2"][0], param_names_m2)
+
+summary_m1.index = [
+    "Purchase rate log(λ) - Intercept",
+    "Dropout rate log(μ) - Intercept",
+    "sigma^2_λ = var[log λ]",
+    "sigma^2_μ = var[log μ]",
+    "sigma_λ_μ = cov[log λ, log μ]"
+]
+summary_m2.index = [
+    "Purchase rate log(λ) - Intercept",
+    "Purchase rate log(λ) - Initial amount ($ 10^-3)",
+    "Dropout rate log(μ) - Intercept",
+    "Dropout rate log(μ) - Initial amount ($ 10^-3)",
+    "sigma^2_λ = var[log λ]",
+    "sigma^2_μ = var[log μ]",
+    "sigma_λ_μ = cov[log λ, log μ]"
+]
 # ------ Construct Table 3 from Abe 2009 (Estimation Results) ------
 # --- Compute correlation between log_lambda and log_mu from posterior (for both models) ---
 def extract_correlation(draws_level2):
@@ -681,12 +666,13 @@ table3_combined.columns = pd.MultiIndex.from_product(
 table3_combined = pd.concat([table3_combined, correlation_row, loglik_row])
 
 # Display Table 3
+print("\nTable 3. Estimation Results for CDNOW Data")
 display(_fmt(table3_combined, 2))
 # Save the table
 with pd.ExcelWriter(excel_path, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
     table3_combined.to_excel(writer, sheet_name="Table 3")
 
-# %% 8. Construct Table 4: Customer-Level Statistics
+# 8. Construct Table 4: Customer-Level Statistics
 # ------ Construct Table 4: Customer-Level Statistics ------
 # Generate posterior predictive draws for validation period
 xstar_m1_draws = draw_future_transactions(cbs, draws_m1, T_star=t_star, seed=42)
@@ -785,6 +771,7 @@ def compute_table4(draws, xstar_draws):
 table4 = compute_table4(draws_m2, xstar_m2_draws)
 
 # Show Table 4 exactly as rounded inside `compute_table4`
+print("\nTable 4. Customer-Level Statistics for CDNOW Data")
 display(table4)
 # Save both new tables
 with pd.ExcelWriter(excel_path, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
